@@ -1,0 +1,66 @@
+name: watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # probe (GitHub may start a scheduled run several minutes late)
+    - cron: "17 9 * * 1"      # weekly keepalive: re-enable this workflow so the 60-day rule never parks it
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send one [TEST] hub watchdog wiring message"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write    # read/write the state cache, prune old state, keepalive enable
+  contents: read
+
+concurrency:
+  group: watchdog   # one run at a time, so two runs never race the state file
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Restore state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: state
+          key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: watchdog-state-
+
+      - name: Probe and alert
+        env:
+          WATCH_BRIDGE_URL: ${{ secrets.WATCH_BRIDGE_URL }}
+          WATCH_COCKPIT_URL: ${{ secrets.WATCH_COCKPIT_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCHDOG_STATE: state/state.json
+          WATCHDOG_TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
+        run: python3 watchdog.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: state
+          key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Prune old state
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key watchdog-state- --sort created_at --order desc \
+            --limit 100 --json id --jq '.[3:][].id' |
+            while read -r id; do gh cache delete "$id" --repo "$GITHUB_REPOSITORY" >/dev/null || true; done
+
+      - name: Keepalive
+        if: github.event.schedule == '17 9 * * 1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog.yml/enable"
