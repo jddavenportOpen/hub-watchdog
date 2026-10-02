@@ -41,7 +41,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WATCHDOG_STATE: state/state.json
           WATCHDOG_TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
-        run: python3 watchdog.py
+        run: python3 hubwatch.py
 
       - name: Save state
         if: always()

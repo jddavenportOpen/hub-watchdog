@@ -1,4 +1,4 @@
-"""Hermetic tests for watchdog.py: no network, no sleeping. Run: python3 -m pytest test_watchdog.py"""
+"""Hermetic tests for hubwatch.py: no network, no sleeping. Run: python3 -m unittest -v test_hubwatch"""
 import json
 import tempfile
 import threading
@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-import watchdog as w
+import hubwatch as w
 
 
 def up(status=200):

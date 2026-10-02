@@ -37,7 +37,7 @@ answers again. Nothing in between.
 3. Run the `watchdog` workflow once by hand with **test_alert** checked. You get a
    single `[TEST] hub watchdog wiring` message, which proves the alert path.
 
-To watch other endpoints, edit `TARGETS` in `watchdog.py`.
+To watch other endpoints, edit `TARGETS` in `hubwatch.py`.
 
 ## How state survives between runs
 
@@ -52,7 +52,7 @@ not silently switch the schedule off.
 ## Tests
 
 ```
-python3 -m unittest -v test_watchdog
+python3 -m unittest -v test_hubwatch
 ```
 
 Standard library only. The tests use a local HTTP server and a fake sender, so they
