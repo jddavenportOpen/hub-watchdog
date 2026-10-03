@@ -1,20 +1,31 @@
 name: watchdog
 
+# Cadence comes from a SELF-DISPATCH CHAIN, not from cron. GitHub's cron scheduler
+# has been dropping or hours-delaying `schedule` runs platform-wide since 2026-08-26
+# (community discussion #206019), while workflow_dispatch fires in seconds. So:
+#   - every run ends by dispatching the next one (a GITHUB_TOKEN workflow_dispatch
+#     DOES create a run; that is GitHub's documented exception);
+#   - the next run's first job waits in the `tick` environment, whose 5-minute wait
+#     timer holds NO runner, so each tick costs seconds of runner time, like cron;
+#   - the concurrency group keeps at most one running + one pending run, so any
+#     extra kick (cron, a manual dispatch, the hub's kicker) folds into ONE chain;
+#   - cron stays as a backstop that restarts the chain if a dispatch ever fails.
 on:
   schedule:
-    # probe every 5 min, offset off the :00/:05 marks where GitHub queues every
-    # other schedule (its docs: runs at high-load times can be delayed or dropped)
     - cron: "3-59/5 * * * *"
-    - cron: "17 9 * * 1"      # weekly keepalive: re-enable this workflow so the 60-day rule never parks it
   workflow_dispatch:
     inputs:
       test_alert:
         description: "Send one [TEST] hub watchdog wiring message"
         type: boolean
         default: false
+      wait:
+        description: "Wait the 5-minute tick before probing (the chain sets this)"
+        type: boolean
+        default: false
 
 permissions:
-  actions: write    # read/write the state cache, prune old state, keepalive enable
+  actions: write    # state cache, prune, dispatch the next tick, keepalive
   contents: read
 
 concurrency:
@@ -22,7 +33,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  tick:
+    if: github.event_name == 'workflow_dispatch' && inputs.wait
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    environment:
+      name: tick    # wait_timer = 5 min, set by deploy.py; no runner is held while it waits
+      deployment: false
+    steps:
+      - run: echo tick
+
   probe:
+    needs: tick
+    if: always() && needs.tick.result != 'failure' && needs.tick.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
@@ -61,8 +84,31 @@ jobs:
             --limit 100 --json id --jq '.[3:][].id' |
             while read -r id; do gh cache delete "$id" --repo "$GITHUB_REPOSITORY" >/dev/null || true; done
 
-      - name: Keepalive
-        if: github.event.schedule == '17 9 * * 1'
+      - name: Keepalive (daily, 09:00-09:09 UTC)
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog.yml/enable"
+        run: |
+          # GitHub parks schedules in a repo idle for 60 days; re-enabling resets that.
+          if [ "$(date -u +%H)" = "09" ] && [ "$(date -u +%M)" -lt 10 ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog.yml/enable" && echo keepalive sent
+          fi
+
+      - name: Dispatch the next tick
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A run already queued behind this one (a manual dispatch, cron, the hub
+          # kicker) carries the chain on; dispatching too would cancel it, because a
+          # concurrency group keeps only the newest pending run.
+          others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow watchdog.yml --limit 20 \
+            --json databaseId,status --jq "[.[] | select(.status != \"completed\" and .databaseId != $GITHUB_RUN_ID)] | length" || echo 0)
+          if [ "${others:-0}" -gt 0 ]; then echo "a run is already queued; it carries the chain"; exit 0; fi
+          for i in 1 2 3; do
+            gh workflow run watchdog.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+              -f wait=true -f test_alert=false && { echo "next tick dispatched"; exit 0; }
+            sleep 10
+          done
+          echo "::error::could not dispatch the next tick; cron or the hub kicker restarts the chain"
+          exit 1
