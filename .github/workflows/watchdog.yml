@@ -9,11 +9,18 @@ name: watchdog
 #     timer holds NO runner, so each tick costs seconds of runner time, like cron;
 #   - the concurrency group keeps at most one running + one pending run, so any
 #     extra kick (cron, a manual dispatch, the hub's kicker) folds into ONE chain;
-#   - cron stays as a backstop that restarts the chain if a dispatch ever fails.
+#   - cron stays as a backstop that restarts the chain if a dispatch ever fails;
+#   - only the deployed repository chains, and a chained run that did not actually
+#     wait in `tick` refuses to chain again: without the wait timer the chain would
+#     re-run back to back (create `tick` BEFORE the first dispatch; see README).
+# A run whose alert path is broken (hubwatch.py exit 3) FAILS on purpose, so an
+# outside dead-man that reads the run list (the hub's kicker) sees a mute watchdog.
 on:
   schedule:
     - cron: "3-59/5 * * * *"
   workflow_dispatch:
+    # The chain dispatches `-f wait=true -f test_alert=false`; never remove or rename
+    # an input it passes, or every in-flight chain run fails to start its successor.
     inputs:
       test_alert:
         description: "Send one [TEST] hub watchdog wiring message"
@@ -23,6 +30,14 @@ on:
         description: "Wait the 5-minute tick before probing (the chain sets this)"
         type: boolean
         default: false
+      check_token:
+        description: "Verify the Telegram bot token this run (getMe; sends nothing)"
+        type: boolean
+        default: false
+      test_label:
+        description: "Optional note in the [TEST] message's label"
+        type: string
+        default: ""
 
 permissions:
   actions: write    # state cache, prune, dispatch the next tick, keepalive
@@ -49,6 +64,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
+      - name: Note when probing starts
+        run: echo "PROBE_STARTED_AT=$(date -u +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Restore state
@@ -66,6 +84,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WATCHDOG_STATE: state/state.json
           WATCHDOG_TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
+          WATCHDOG_CHECK_TOKEN: ${{ github.event_name == 'workflow_dispatch' && inputs.check_token }}
+          WATCHDOG_TEST_LABEL: ${{ github.event_name == 'workflow_dispatch' && inputs.test_label || '' }}
         run: python3 hubwatch.py
 
       - name: Save state
@@ -80,8 +100,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh cache list --repo "$GITHUB_REPOSITORY" --key watchdog-state- --sort created_at --order desc \
-            --limit 100 --json id --jq '.[3:][].id' |
+          # Default branch only: a run on any other ref saves a cache that only that ref
+          # can read, and counting those here would evict the state master restores.
+          gh cache list --repo "$GITHUB_REPOSITORY" --ref refs/heads/master --key watchdog-state- \
+            --sort created_at --order desc --limit 100 --json id --jq '.[3:][].id' |
             while read -r id; do gh cache delete "$id" --repo "$GITHUB_REPOSITORY" >/dev/null || true; done
 
       - name: Keepalive (daily, 09:00-09:09 UTC)
@@ -95,18 +117,39 @@ jobs:
           fi
 
       - name: Dispatch the next tick
-        if: always()
+        # Only the deployed repository chains: a fork or a copy has no `tick` wait timer
+        # until someone creates one. A copy that has created it puts its own name here.
+        if: always() && github.repository == 'jddavenportOpen/hub-watchdog'
         env:
           GH_TOKEN: ${{ github.token }}
+          WAITED: ${{ github.event_name == 'workflow_dispatch' && inputs.wait }}
         run: |
+          # A chained run should have waited 5 min in `tick`. One that probed sooner has
+          # no wait timer behind it (the environment is missing or lost its timer), and
+          # chaining from it would start runs back to back. Stop the chain and fail the
+          # run; cron and the hub's kicker notice a stopped chain.
+          if [ "$WAITED" = "true" ] && [ -n "${PROBE_STARTED_AT:-}" ]; then
+            created=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at || true)
+            created_s=$(date -u -d "$created" +%s 2>/dev/null || true)
+            if [ -n "$created" ] && [ -n "$created_s" ]; then
+              waited=$(( PROBE_STARTED_AT - created_s ))
+              echo "this run probed ${waited}s after it was created"
+              if [ "$waited" -lt 240 ]; then
+                echo "::error::a wait=true run probed ${waited}s after creation (< 240 s): the tick environment has no wait timer; not chaining"
+                exit 1
+              fi
+            fi
+          fi
           # A run already queued behind this one (a manual dispatch, cron, the hub
           # kicker) carries the chain on; dispatching too would cancel it, because a
           # concurrency group keeps only the newest pending run.
           others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow watchdog.yml --limit 20 \
             --json databaseId,status --jq "[.[] | select(.status != \"completed\" and .databaseId != $GITHUB_RUN_ID)] | length" || echo 0)
           if [ "${others:-0}" -gt 0 ]; then echo "a run is already queued; it carries the chain"; exit 0; fi
+          # No --ref: gh dispatches on the repository's default branch, so a run started
+          # on another ref (a test branch) never moves the chain off master.
           for i in 1 2 3; do
-            gh workflow run watchdog.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            gh workflow run watchdog.yml --repo "$GITHUB_REPOSITORY" \
               -f wait=true -f test_alert=false && { echo "next tick dispatched"; exit 0; }
             sleep 10
           done
